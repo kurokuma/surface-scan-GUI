@@ -144,7 +144,7 @@ impl ScannerApp {
             started: None,
             finished_elapsed: None,
             stop_reason: String::new(),
-            message: "IPv4 / CIDRを入力してください。許可された対象に使用してください。".into(),
+            message: "IPv4 / CIDRを入力してください".into(),
             ui_tx,
             ui_rx,
             io_busy: false,
