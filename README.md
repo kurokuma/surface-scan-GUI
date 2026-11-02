@@ -1,6 +1,10 @@
 # Web Service Fingerprint
 
-Rust製のWindows向けWebサービス調査GUIです。egui/eframeのGUIとスキャン子プロセスを分離し、子プロセス内ではTokioのマルチスレッドランタイムで非同期通信します。
+Rust製のWebサービス調査GUIです。egui/eframeのGUIとスキャン子プロセスを分離し、子プロセス内ではTokioのマルチスレッドランタイムで非同期通信します。Windowsでビルド・動作検証済みです。macOS/Linux向けのビルド手順も以下に記載していますが、このプロジェクトでのビルド・実機動作は未検証です。
+
+![Web Service FingerprintのGUI。スキャン設定、Body列を含む結果テーブル、選択行の詳細JSON](images/sample.png)
+
+*Windowsでの画面例。スクリーンショット内の結果は表示確認用のサンプルデータです。*
 
 ## 起動
 
@@ -11,6 +15,123 @@ cargo run --release --locked
 ```
 
 Windows + Rust 1.94 / MSVC Build Toolsでビルド・検証。依存関係はCargo.lockで固定しています。WebViewやNode.jsは不要です。
+
+## OS別のビルド
+
+[build.ps1](build.ps1) はPowerShell用、[build.sh](build.sh) はmacOS/Linux等のPOSIXシェル用です。どのディレクトリから実行してもプロジェクトのルートへ移動し、`cargo build --locked --release --target <ターゲット>` を実行します。ターゲットを省略した場合は `rustc -vV` のホストを使用します。Rustターゲット・SDK・OSパッケージのインストール、アプリの起動、スキャンは行いません。
+
+Rust/CargoをPATHに登録してください。以下の手順は検証環境と同じRust 1.94以降を想定しています。
+
+| OS / CPU | ターゲット例 | このプロジェクトでの検証 |
+| --- | --- | --- |
+| Windows x64 | `x86_64-pc-windows-msvc` | ビルド・GUI動作を確認済み |
+| macOS Apple Silicon | `aarch64-apple-darwin` | 未検証 |
+| macOS Intel | `x86_64-apple-darwin` | 未検証 |
+| Linux x64 | `x86_64-unknown-linux-gnu` | 未検証 |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` | 未検証 |
+
+### Windows
+
+Visual Studio Build Toolsの「C++によるデスクトップ開発」とWindows SDKを用意します。MSVC用のRustツールチェーンを使用してください。
+
+```powershell
+.\build.ps1
+
+# ターゲット指定 / 開発ビルド / チェックのみ / オフライン
+.\build.ps1 -Target x86_64-pc-windows-msvc
+.\build.ps1 -Development
+.\build.ps1 -Check -Offline
+.\build.ps1 -Help
+
+# ビルドしたGUIを起動
+.\target\x86_64-pc-windows-msvc\release\http-service-scan-gui.exe
+```
+
+### macOS
+
+Xcode Command Line ToolsとRustを用意し、macOS上でネイティブビルドします。
+
+```sh
+xcode-select --install  # 未導入の場合
+sh build.sh
+
+# Apple Silicon / Intelを明示する場合
+sh build.sh --target aarch64-apple-darwin
+sh build.sh --target x86_64-apple-darwin
+
+# Apple Silicon版の起動例
+./target/aarch64-apple-darwin/release/http-service-scan-gui
+```
+
+別CPU向けには先に対応するRustターゲットを導入してください。生成物は単体のMach-O実行ファイルです。`.app` バンドル、Universal Binary、署名、公証、DMG作成はスクリプトの対象外です。
+
+現在のフォント読込はWindows用パスとLinuxのNoto CJK用パスのみで、macOSのシステムCJKフォントは自動検出しません。そのためmacOSでの日本語・中国語表示にはフォント読込処理の追加対応が必要です。ビルド成功とGUI表示品質は別途確認してください。
+
+### Linux
+
+この構成はX11/WaylandとOpenGL（glow）を使用します。Ubuntu/Debian系での依存パッケージ例です。ディストリビューションやデスクトップ環境に応じて調整してください。
+
+```sh
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config \
+  libx11-dev libxrandr-dev libxi-dev libxcursor-dev \
+  libxkbcommon-dev libwayland-dev libgl1-mesa-dev fonts-noto-cjk
+
+sh build.sh
+./target/x86_64-unknown-linux-gnu/release/http-service-scan-gui
+
+# その他のオプション
+sh build.sh --development
+sh build.sh --check --offline
+sh build.sh --help
+```
+
+実行にはX11またはWaylandのGUIセッションと、OpenGLを利用可能なドライバーが必要です。ファイルダイアログはrfdの既定XDG Desktop Portalバックエンドを使用するため、セッションD-Busとデスクトップに合ったportalを用意してください。GTK系環境なら `xdg-desktop-portal` と `xdg-desktop-portal-gtk`、KDEなら対応するKDEバックエンドが対象です。SSHだけの環境ではGUIは表示できません。
+
+日本語・中国語の表示には、コードが参照する `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc` が配置されていることも確認してください。パッケージのフォント配置が異なる場合は読込パスの調整が必要です。
+
+### 出力先とスクリプトのオプション
+
+| 用途 | PowerShell | POSIXシェル |
+| --- | --- | --- |
+| Releaseビルド（既定） | `.\build.ps1` | `sh build.sh` |
+| ターゲット指定 | `-Target <triple>` | `--target <triple>` |
+| Debugビルド | `-Development` | `--development` |
+| コンパイルチェックのみ | `-Check` | `--check` |
+| ネットワークを使用しない | `-Offline` | `--offline` |
+| ヘルプ | `-Help` | `--help` |
+
+オプションは組み合わせ可能です。`--check` / `-Check` は実行ファイルを生成せず、リンク・GUI動作を検証しません。オフライン実行には依存クレートが事前取得済みである必要があります。
+
+両スクリプトは常にターゲットを明示するため、既定の出力先は `target/<triple>/release/`、開発ビルドは `target/<triple>/debug/` です。Windowsではファイル名に `.exe` が付きます。`CARGO_TARGET_DIR` やCargo設定で出力先を変えた場合はその設定が優先されます。ターゲット指定なしで直接 `cargo build --release --locked` を使った場合は、通常 `target/release/` に出力されます。
+
+## クロスコンパイル
+
+異なるOS/CPU向けには、Rust標準ライブラリに加えて、そのターゲット用のリンカー、Cコンパイラー、SDK/sysroot、ネイティブライブラリが必要です。`rustup target add` だけではそれらは導入されません。このアプリにはring等のCビルドやGUI依存があるため、ターゲット指定だけで全OS向けにビルドできるものではありません。[rustupのクロスコンパイル説明](https://rust-lang.github.io/rustup/cross-compilation.html)
+
+```sh
+# 例: macOS上で別のmacOS CPU向けのRust標準ライブラリを導入
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+sh build.sh --target aarch64-apple-darwin
+sh build.sh --target x86_64-apple-darwin
+```
+
+macOS向けにはAppleのSDKと適切なClang/リンカーが必要です。macOS上でのビルドを基本とし、Windows/LinuxからのmacOS向けビルド環境はこのスクリプトでは構築しません。[RustのmacOSターゲット要件](https://doc.rust-lang.org/rustc/platform-support/apple-darwin.html)
+
+Linux x64からLinux ARM64 GNU向けにビルドする場合の設定例です。ARM64用のCツールチェーン・sysroot・必要なネイティブライブラリが事前に用意されている環境を想定しており、このプロジェクトでは未検証です。
+
+```sh
+rustup target add aarch64-unknown-linux-gnu
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+sh build.sh --target aarch64-unknown-linux-gnu
+```
+
+必要に応じてターゲット側のpkg-config検索先も設定してください。ホスト側のライブラリを混ぜないことが重要です。リンカーは `.cargo/config.toml` の `[target.<triple>]` または環境変数で指定できます。[Cargoのターゲット設定](https://doc.rust-lang.org/cargo/reference/config.html#target)
+
+Windows MSVC向けにはWindows SDKとMSVC互換のビルド環境が必要です。WindowsからLinux向けにはLinux用ツールチェーンが必要で、WSL2やLinux環境でLinux版をビルドする方法もあります。配布用にはWindows・macOS・LinuxそれぞれのマシンまたはCIランナーでネイティブビルドし、対象OSで起動・ファイルダイアログ・子プロセス起動・保存を確認する構成を推奨します。Linux GNU版は配布先のglibc/GUIライブラリとの互換性も確認してください。
+
+参考: [eframeの対応プラットフォーム](https://github.com/emilk/egui/blob/0.31.1/README.md)、[rfdのLinuxバックエンド](https://docs.rs/rfd/0.15.4/rfd/#linux--bsd-backends)。
 
 ## 操作
 
