@@ -5,6 +5,7 @@ mod export;
 mod input;
 mod model;
 mod scan;
+mod session;
 mod text;
 mod tls;
 mod worker;

@@ -63,7 +63,7 @@ def main():
         for child in children:
             stdout, stderr = child.communicate(timeout=15)
             assert child.returncode == 0, stderr.decode(errors="replace")
-            rows.extend(json.loads(line) for line in stdout.splitlines())
+            rows.extend(json.loads(line)["record"] for line in stdout.splitlines())
         assert len(rows) == 4
         assert len({(r["ip"], r["port"], r["scheme"]) for r in rows}) == 4
         for row in rows:

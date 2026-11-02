@@ -13,6 +13,9 @@ pub struct Config {
     pub host: String,
     pub worker_index: usize,
     pub workers: usize,
+    /// Stable job ordinals whose complete results are already retained by the GUI.
+    #[serde(default)]
+    pub completed_jobs: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

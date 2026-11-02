@@ -1,6 +1,7 @@
 use crate::{
     input,
     model::{Config, Record},
+    session::ScanSession,
     worker::{self, Event},
 };
 use eframe::egui::{self, Color32, RichText};
@@ -54,10 +55,12 @@ pub struct ScannerApp {
     cancel: Arc<AtomicBool>,
     running: bool,
     scan_handle: Option<std::thread::JoinHandle<()>>,
+    scan_session: Option<ScanSession>,
     total: u64,
     received: u64,
     started: Option<Instant>,
     finished_elapsed: Option<Duration>,
+    elapsed_before_run: Duration,
     stop_reason: String,
     message: String,
     ui_tx: Sender<UiEvent>,
@@ -141,12 +144,14 @@ impl ScannerApp {
             last_filter_cost: Duration::ZERO,
             scan_rx: None,
             scan_handle: None,
+            scan_session: None,
             cancel: Arc::new(AtomicBool::new(false)),
             running: false,
             total: 0,
             received: 0,
             started: None,
             finished_elapsed: None,
+            elapsed_before_run: Duration::ZERO,
             stop_reason: String::new(),
             message: "IPv4 / CIDRを入力してください".into(),
             ui_tx,
@@ -156,6 +161,14 @@ impl ScannerApp {
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.running && !self.io_busy,
+            "停止処理またはファイル処理の完了を待ってください"
+        );
+        if self.has_pending() {
+            let config = self.scan_session.as_ref().unwrap().resume_config();
+            return self.launch_scan(config);
+        }
         let ranges = input::targets(&self.input, self.extract)?;
         let ports = input::ports(&self.ports)?;
         let schemes: Vec<String> = [(self.http, "http"), (self.https, "https")]
@@ -182,9 +195,24 @@ impl ScannerApp {
             host,
             worker_index: 0,
             workers: self.processes,
+            completed_jobs: vec![],
         };
         self.clear_results();
         self.total = total;
+        self.scan_session = Some(ScanSession::new(config.clone()));
+        self.launch_scan(config)
+    }
+
+    fn has_pending(&self) -> bool {
+        self.scan_session.as_ref().is_some_and(ScanSession::pending)
+    }
+
+    fn launch_scan(&mut self, config: Config) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.rows.len() < self.max_rows,
+            "結果保持上限を増やすか、結果をクリアして新規スキャンしてください"
+        );
+        self.elapsed_before_run = self.finished_elapsed.unwrap_or_default();
         self.cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::sync_channel(128);
         self.scan_rx = Some(rx);
@@ -195,7 +223,7 @@ impl ScannerApp {
         self.dirty = true;
         self.message = format!(
             "スキャン中 · {}プロセス × {}同時プローブ",
-            self.processes, self.concurrency
+            config.workers, config.concurrency
         );
         if let Some(handle) = self.scan_handle.take() {
             let _ = handle.join();
@@ -205,6 +233,7 @@ impl ScannerApp {
     }
 
     fn clear_results(&mut self) {
+        self.scan_session = None;
         self.rows.clear();
         self.search_index.clear();
         self.visible.clear();
@@ -219,6 +248,7 @@ impl ScannerApp {
         self.received = 0;
         self.started = None;
         self.finished_elapsed = None;
+        self.elapsed_before_run = Duration::ZERO;
         self.stop_reason.clear();
         self.scan_rx = None;
         self.dirty = false;
@@ -230,17 +260,21 @@ impl ScannerApp {
         if let Some(rx) = &self.scan_rx {
             while began.elapsed() < Duration::from_millis(8) {
                 match rx.try_recv() {
-                    Ok(Event::Row(row)) => {
-                        self.received += 1;
+                    Ok(Event::Row(job_id, row)) => {
                         if self.rows.len() < self.max_rows {
-                            self.rows.push(Arc::from(row));
-                            self.dirty = true;
+                            if let Some(session) = self.scan_session.as_mut() {
+                                if session.accept(job_id) {
+                                    self.received = session.completed();
+                                    self.rows.push(Arc::from(row));
+                                    self.dirty = true;
+                                }
+                            }
                         }
                         if self.rows.len() >= self.max_rows && self.received < self.total {
                             self.cancel.store(true, Ordering::Relaxed);
                             self.stop_reason = format!("保持上限 {} 件", self.max_rows);
                             self.message = format!(
-                                "保持上限 {} 件に達したため停止中。保存後に対象を分割してください",
+                                "保持上限 {} 件に達したため停止中。再開するには結果保持上限を増やしてください",
                                 self.max_rows
                             );
                         }
@@ -250,12 +284,17 @@ impl ScannerApp {
                     }
                     Ok(Event::Done(stopped)) => {
                         self.running = false;
-                        self.finished_elapsed = self.started.map(|t| t.elapsed());
+                        self.finished_elapsed =
+                            self.started.map(|t| self.elapsed_before_run + t.elapsed());
                         self.dirty = true;
                         if !self.message.starts_with("エラー:") {
                             self.message = format!(
                                 "{} · 受信 {} / {} · 保持 {} 件 {}",
-                                if stopped { "停止" } else { "完了" },
+                                if stopped || self.has_pending() {
+                                    "一時停止（スキャン開始で続きから再開）"
+                                } else {
+                                    "完了"
+                                },
                                 self.received,
                                 self.total,
                                 self.rows.len(),
@@ -267,7 +306,8 @@ impl ScannerApp {
                         if self.running {
                             self.message = "workerとの接続が終了しました".into();
                             self.running = false;
-                            self.finished_elapsed = self.started.map(|t| t.elapsed());
+                            self.finished_elapsed =
+                                self.started.map(|t| self.elapsed_before_run + t.elapsed());
                         }
                         break;
                     }
@@ -284,6 +324,7 @@ impl ScannerApp {
                 }
                 UiEvent::Saved(Ok(path)) => self.message = format!("保存しました: {path}"),
                 UiEvent::Loaded(Ok(rows)) => {
+                    self.scan_session = None;
                     self.rows = rows;
                     self.search_index.clear();
                     self.selected = None;
@@ -297,6 +338,7 @@ impl ScannerApp {
                     self.received = 0;
                     self.started = None;
                     self.finished_elapsed = None;
+                    self.elapsed_before_run = Duration::ZERO;
                     self.message = format!("保存結果を読み込みました · {} 件", self.rows.len());
                 }
                 UiEvent::Imported(Err(e)) | UiEvent::Saved(Err(e)) | UiEvent::Loaded(Err(e)) => {
@@ -471,7 +513,7 @@ impl eframe::App for ScannerApp {
                 let progress = (self.received as f64 / self.total as f64) as f32;
                 let elapsed = self
                     .finished_elapsed
-                    .or_else(|| self.started.map(|t| t.elapsed()))
+                    .or_else(|| self.started.map(|t| self.elapsed_before_run + t.elapsed()))
                     .map(|t| t.as_secs_f64())
                     .unwrap_or(0.0);
                 ui.add(egui::ProgressBar::new(progress).text(format!(
@@ -486,7 +528,7 @@ impl eframe::App for ScannerApp {
         egui::SidePanel::left("settings").default_width(310.0).resizable(true).show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_space(8.0); ui.heading("スキャン設定"); ui.separator();
-                ui.add_enabled_ui(!self.running, |ui| {
+                ui.add_enabled_ui(!self.running && !self.has_pending() && !self.io_busy, |ui| {
                     ui.label("対象 IPv4 / CIDR");
                     egui::ScrollArea::vertical()
                         .id_salt("target-input")
@@ -516,17 +558,21 @@ impl eframe::App for ScannerApp {
                         ui.label("Host / TLS SNI（任意のドメイン名）"); ui.text_edit_singleline(&mut self.host);
                         ui.label("接続先は入力IPに固定されます");
                         ui.horizontal(|ui| { ui.label("プローブ上限"); ui.add(egui::DragValue::new(&mut self.max_jobs).range(1..=10_000_000).speed(100.0)); });
-                        ui.horizontal(|ui| { ui.label("結果保持上限"); ui.add(egui::DragValue::new(&mut self.max_rows).range(1..=100_000).speed(100.0)); });
                         ui.label("保持上限に達すると停止します。本文・Base64・JSON表示にメモリを使用します。");
                     });
                 });
+                ui.add_enabled_ui(!self.running, |ui| {
+                    ui.horizontal(|ui| { ui.label("結果保持上限"); ui.add(egui::DragValue::new(&mut self.max_rows).range(1..=100_000).speed(100.0)); });
+                });
+                if self.has_pending() && !self.running { ui.label("一時停止中：結果を保持して続きから再開できます。新規スキャンは「結果をクリア」。"); }
                 ui.add_space(12.0);
-                if self.running {
-                    if ui.add_sized([ui.available_width(),36.0], egui::Button::new("停止する")).clicked() {
-                        self.cancel.store(true, Ordering::Relaxed); self.stop_reason = "ユーザーによる停止".into(); self.message = "停止中…".into();
-                    }
-                } else if ui.add_enabled(!self.io_busy, egui::Button::new("スキャン開始").fill(Color32::from_rgb(24,111,100)).min_size(egui::vec2(ui.available_width(),36.0))).clicked() {
+                let stopping = self.running && self.cancel.load(Ordering::Relaxed);
+                let start_label = if self.has_pending() && !self.running { "スキャン開始（続きから）" } else { "スキャン開始" };
+                if ui.add_enabled(!self.running && !self.io_busy, egui::Button::new(start_label).fill(Color32::from_rgb(24,111,100)).min_size(egui::vec2(ui.available_width(),36.0))).clicked() {
                     if let Err(e) = self.start() { self.message = e.to_string(); }
+                }
+                if ui.add_enabled(self.running && !stopping, egui::Button::new(if stopping { "停止中…" } else { "スキャン停止" }).min_size(egui::vec2(ui.available_width(),32.0))).clicked() {
+                    self.cancel.store(true, Ordering::Relaxed); self.stop_reason = "ユーザーによる一時停止".into(); self.message = "停止中… 結果を保持しています".into();
                 }
                 ui.add_space(8.0);
                 ui.small("CIDRはネットワーク・ブロードキャストを含む全アドレス。重複は除去します。リダイレクトは追跡しません。");
@@ -536,7 +582,7 @@ impl eframe::App for ScannerApp {
             ui.horizontal(|ui| {
                 ui.heading("結果");
                 if ui.add_enabled(!self.running && !self.io_busy,egui::Button::new("結果を読込…")).clicked() { self.load_results(); }
-                if ui.add_enabled(!self.running && !self.io_busy && !self.rows.is_empty(),egui::Button::new("結果をクリア")).on_hover_text("結果・詳細・検索条件・進捗表示をクリアします。スキャン設定は保持します。").clicked() { self.clear_results(); }
+                if ui.add_enabled(!self.running && !self.io_busy && (!self.rows.is_empty() || self.has_pending()),egui::Button::new("結果をクリア")).on_hover_text("結果・詳細・検索条件・進捗と再開情報をクリアします。スキャン設定は保持します。").clicked() { self.clear_results(); }
                 ui.label(format!("{} / {} 件", self.visible.len(), self.rows.len()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_enabled_ui(!self.io_busy && !self.rows.is_empty(), |ui| {

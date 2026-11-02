@@ -294,6 +294,7 @@ mod tests {
             host: String::new(),
             worker_index: 0,
             workers: 1,
+            completed_jobs: vec![],
         };
         let r = probe(&cfg, Ipv4Addr::LOCALHOST, port, "http").await;
         tokio::time::timeout(Duration::from_secs(5), server)
@@ -342,6 +343,7 @@ mod tests {
                 host: "fixture.test".into(),
                 worker_index: 0,
                 workers: 1,
+                completed_jobs: vec![],
             };
             let r = probe(&cfg, Ipv4Addr::LOCALHOST, port, "http").await;
             tokio::time::timeout(Duration::from_secs(5), server)
@@ -394,6 +396,7 @@ mod tests {
             host: String::new(),
             worker_index: 0,
             workers: 1,
+            completed_jobs: vec![],
         };
         let r = probe(&cfg, Ipv4Addr::LOCALHOST, port, "http").await;
         server.await.unwrap();

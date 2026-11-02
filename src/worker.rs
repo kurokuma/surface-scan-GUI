@@ -14,9 +14,15 @@ use std::{
 };
 
 pub enum Event {
-    Row(Box<Record>),
+    Row(u64, Box<Record>),
     Problem(String),
     Done(bool),
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WorkerRow {
+    job_id: u64,
+    record: Record,
 }
 
 pub fn run_worker() -> Result<()> {
@@ -35,6 +41,8 @@ pub fn run_worker() -> Result<()> {
     runtime.block_on(async {
         let config = Arc::new(config);
         let cfg = &*config;
+        let completed: std::collections::HashSet<u64> =
+            cfg.completed_jobs.iter().copied().collect();
         let jobs = cfg
             .ranges
             .iter()
@@ -45,15 +53,21 @@ pub fn run_worker() -> Result<()> {
                     .flat_map(move |&port| cfg.schemes.iter().map(move |scheme| (ip, port, scheme)))
             })
             .enumerate()
-            .filter(|(i, _)| i % cfg.workers == cfg.worker_index)
-            .map(|(_, job)| job);
+            .filter(|(i, _)| {
+                i % cfg.workers == cfg.worker_index && !completed.contains(&(*i as u64))
+            });
         let mut results = stream::iter(jobs)
-            .map(|(ip, port, scheme)| {
+            .map(|(job_id, (ip, port, scheme))| {
                 // Probes run on runtime threads so a full stdout pipe here cannot stall their I/O
                 // and turn slow GUI consumption into false timeouts.
                 let config = config.clone();
                 let scheme = scheme.clone();
-                tokio::spawn(async move { crate::scan::probe(&config, ip, port, &scheme).await })
+                tokio::spawn(async move {
+                    WorkerRow {
+                        job_id: job_id as u64,
+                        record: crate::scan::probe(&config, ip, port, &scheme).await,
+                    }
+                })
             })
             .buffer_unordered(cfg.concurrency);
         let mut output = std::io::BufWriter::new(std::io::stdout().lock());
@@ -68,7 +82,7 @@ pub fn run_worker() -> Result<()> {
 
 /// Workers end every record with a newline, so a final unterminated line means the process was
 /// killed mid-write. Unexpected exits are reported from the exit status, not from this fragment.
-fn read_record(reader: &mut impl BufRead, line: &mut Vec<u8>) -> Result<Option<Record>> {
+fn read_record(reader: &mut impl BufRead, line: &mut Vec<u8>) -> Result<Option<WorkerRow>> {
     line.clear();
     reader.read_until(b'\n', line)?;
     if line.last() != Some(&b'\n') {
@@ -128,7 +142,10 @@ pub fn launch(
                         loop {
                             match read_record(&mut stdout, &mut line) {
                                 Ok(Some(row)) => {
-                                    if sender.send(Event::Row(Box::new(row))).is_err() {
+                                    if sender
+                                        .send(Event::Row(row.job_id, Box::new(row.record)))
+                                        .is_err()
+                                    {
                                         break;
                                     }
                                 }
@@ -202,10 +219,13 @@ mod tests {
     use super::*;
     #[test]
     fn killed_worker_fragment_is_not_a_parse_error() {
-        let mut input = std::io::Cursor::new(b"{\"port\":80}\n{\"port\":8".to_vec());
+        let mut input =
+            std::io::Cursor::new(b"{\"job_id\":7,\"record\":{\"port\":80,\"timestamp_unix_ms\":1234567890123}}\n{\"job_id\":8,\"record\":{\"port\":8".to_vec());
         let mut line = Vec::new();
         let row = read_record(&mut input, &mut line).unwrap().unwrap();
-        assert_eq!(row.port, 80);
+        assert_eq!(row.record.port, 80);
+        assert_eq!(row.job_id, 7);
+        assert_eq!(row.record.timestamp_unix_ms, 1234567890123);
         assert!(read_record(&mut input, &mut line).unwrap().is_none());
         let mut input = std::io::Cursor::new(b"not json\n".to_vec());
         assert!(read_record(&mut input, &mut line).is_err());
