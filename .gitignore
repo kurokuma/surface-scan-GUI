@@ -1,0 +1,6 @@
+/target/
+*.tmp
+fingerprints.csv
+*.csv
+fingerprints.json
+*.json
