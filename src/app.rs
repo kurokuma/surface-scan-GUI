@@ -176,7 +176,6 @@ impl ScannerApp {
         );
         let total = input::job_count(&ranges, ports.len(), schemes.len());
         anyhow::ensure!(total <= self.max_jobs, "予定プローブ数 {} が上限 {} を超えています。対象を絞るか詳細設定の上限を変更してください", total, self.max_jobs);
-        self.total = total;
         let config = Config {
             ranges,
             ports,
@@ -189,11 +188,8 @@ impl ScannerApp {
             worker_index: 0,
             workers: self.processes,
         };
-        self.rows.clear();
-        self.visible.clear();
-        self.detail.clear();
-        self.selected = None;
-        self.received = 0;
+        self.clear_results();
+        self.total = total;
         self.cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::sync_channel(128);
         self.scan_rx = Some(rx);
@@ -211,6 +207,26 @@ impl ScannerApp {
         }
         self.scan_handle = Some(worker::launch(config, self.cancel.clone(), tx));
         Ok(())
+    }
+
+    fn clear_results(&mut self) {
+        self.rows.clear();
+        self.visible.clear();
+        self.selected = None;
+        self.detail.clear();
+        self.table_focused = false;
+        self.query.clear();
+        self.status_filter.clear();
+        self.scheme_filter = 0;
+        self.successes_only = false;
+        self.total = 0;
+        self.received = 0;
+        self.started = None;
+        self.finished_elapsed = None;
+        self.stop_reason.clear();
+        self.scan_rx = None;
+        self.dirty = false;
+        self.message = "結果をクリアしました".into();
     }
 
     fn poll(&mut self) {
@@ -515,6 +531,7 @@ impl eframe::App for ScannerApp {
             ui.horizontal(|ui| {
                 ui.heading("結果");
                 if ui.add_enabled(!self.running && !self.io_busy,egui::Button::new("結果を読込…")).clicked() { self.load_results(); }
+                if ui.add_enabled(!self.running && !self.io_busy && !self.rows.is_empty(),egui::Button::new("結果をクリア")).on_hover_text("結果・詳細・検索条件・進捗表示をクリアします。スキャン設定は保持します。").clicked() { self.clear_results(); }
                 ui.label(format!("{} / {} 件", self.visible.len(), self.rows.len()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_enabled_ui(!self.io_busy && !self.rows.is_empty(), |ui| {
