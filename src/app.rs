@@ -36,6 +36,7 @@ pub struct ScannerApp {
     max_jobs: u64,
     max_rows: usize,
     rows: Vec<Arc<Record>>,
+    search_index: Vec<String>,
     visible: Vec<usize>,
     selected: Option<usize>,
     detail: String,
@@ -48,6 +49,7 @@ pub struct ScannerApp {
     descending: bool,
     dirty: bool,
     last_filter: Instant,
+    last_filter_cost: Duration,
     scan_rx: Option<Receiver<Event>>,
     cancel: Arc<AtomicBool>,
     running: bool,
@@ -123,6 +125,7 @@ impl ScannerApp {
             max_jobs: 100_000,
             max_rows: 10_000,
             rows: Vec::new(),
+            search_index: Vec::new(),
             visible: Vec::new(),
             selected: None,
             detail: String::new(),
@@ -135,6 +138,7 @@ impl ScannerApp {
             descending: false,
             dirty: false,
             last_filter: Instant::now(),
+            last_filter_cost: Duration::ZERO,
             scan_rx: None,
             scan_handle: None,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -160,20 +164,11 @@ impl ScannerApp {
             .map(|(_, s)| s.into())
             .collect();
         anyhow::ensure!(!schemes.is_empty(), "HTTP / HTTPSを選択してください");
-        let host = self.host.trim().to_owned();
-        anyhow::ensure!(
-            host.is_empty()
-                || (host.parse::<Ipv4Addr>().is_err()
-                    && host.len() <= 253
-                    && host.split('.').all(|label| !label.is_empty()
-                        && label.len() <= 63
-                        && !label.starts_with('-')
-                        && !label.ends_with('-')
-                        && label
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b == b'-'))),
-            "Host/SNIはドメイン名のみを指定してください"
-        );
+        let host = if self.host.trim().is_empty() {
+            String::new()
+        } else {
+            input::host(&self.host)?
+        };
         let total = input::job_count(&ranges, ports.len(), schemes.len());
         anyhow::ensure!(total <= self.max_jobs, "予定プローブ数 {} が上限 {} を超えています。対象を絞るか詳細設定の上限を変更してください", total, self.max_jobs);
         let config = Config {
@@ -211,6 +206,7 @@ impl ScannerApp {
 
     fn clear_results(&mut self) {
         self.rows.clear();
+        self.search_index.clear();
         self.visible.clear();
         self.selected = None;
         self.detail.clear();
@@ -289,6 +285,7 @@ impl ScannerApp {
                 UiEvent::Saved(Ok(path)) => self.message = format!("保存しました: {path}"),
                 UiEvent::Loaded(Ok(rows)) => {
                     self.rows = rows;
+                    self.search_index.clear();
                     self.selected = None;
                     self.detail.clear();
                     self.query.clear();
@@ -307,20 +304,27 @@ impl ScannerApp {
                 }
             }
         }
-        if self.dirty && (!self.running || self.last_filter.elapsed() > Duration::from_millis(250))
-        {
+        // During a scan, keep refiltering to a small share of frame time on large result sets.
+        let interval = Duration::from_millis(250).max(self.last_filter_cost * 4);
+        if self.dirty && (!self.running || self.last_filter.elapsed() > interval) {
             self.filter();
         }
     }
 
     fn filter(&mut self) {
+        let began = Instant::now();
         let query = self.query.to_lowercase();
         let status = self.status_filter.trim();
+        if !query.is_empty() {
+            let built = self.search_index.len();
+            self.search_index
+                .extend(self.rows[built..].iter().map(|r| r.search_text()));
+        }
         self.visible = self
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| {
+            .filter(|(i, r)| {
                 (!self.successes_only || r.status.is_some())
                     && (self.scheme_filter == 0
                         || r.scheme
@@ -333,7 +337,7 @@ impl ScannerApp {
                         || r.status
                             .map(|s| s.to_string().starts_with(status))
                             .unwrap_or(false))
-                    && (query.is_empty() || r.search_text().contains(&query))
+                    && (query.is_empty() || self.search_index[*i].contains(&query))
             })
             .map(|(i, _)| i)
             .collect();
@@ -374,6 +378,7 @@ impl ScannerApp {
         });
         self.dirty = false;
         self.last_filter = Instant::now();
+        self.last_filter_cost = began.elapsed();
     }
 
     fn import(&mut self) {
@@ -506,7 +511,7 @@ impl eframe::App for ScannerApp {
                         ui.label("タイムアウト / 秒"); ui.add(egui::DragValue::new(&mut self.timeout).range(1..=120)); ui.end_row();
                         ui.label("本文・icon上限 / KiB"); ui.add(egui::DragValue::new(&mut self.body_kib).range(1..=1024)); ui.end_row();
                     });
-                    ui.checkbox(&mut self.insecure, "未検証・自己署名証明書も収集").on_hover_text("有効時はTLSの信頼性・ホスト名を検証しません。署名ハンドシェイクは検証します。");
+                    ui.checkbox(&mut self.insecure, "未検証・自己署名証明書も収集").on_hover_text("有効時はTLSの信頼性・ホスト名を検証しません。HTTP取得の接続では署名も検証しません。TLS情報収集の接続では署名ハンドシェイクを検証します。");
                     ui.collapsing("詳細設定", |ui| {
                         ui.label("Host / TLS SNI（任意のドメイン名）"); ui.text_edit_singleline(&mut self.host);
                         ui.label("接続先は入力IPに固定されます");

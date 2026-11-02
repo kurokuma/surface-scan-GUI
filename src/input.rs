@@ -11,15 +11,27 @@ pub fn targets(text: &str, extract: bool) -> Result<Vec<(u32, u32)>> {
         RE.get_or_init(|| Regex::new(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?:/[0-9]{1,3})?").unwrap());
     let tokens: Vec<&str> = if extract {
         re.find_iter(text)
-            .filter(|m| {
-                let bad = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '/';
-                !text[..m.start()]
+            .filter_map(|m| {
+                let before = &text[..m.start()];
+                if before
                     .chars()
                     .next_back()
                     .is_some_and(|c| c.is_ascii_alphanumeric() || c == '.')
-                    && !text[m.end()..].chars().next().is_some_and(bad)
+                {
+                    return None;
+                }
+                // A slash after a URL host or a second slash starts a path, not a CIDR prefix.
+                let token = m.as_str();
+                let token = match token.split_once('/') {
+                    Some((ip, _))
+                        if before.ends_with("://") || text[m.end()..].starts_with('/') =>
+                    {
+                        ip
+                    }
+                    _ => token,
+                };
+                token_ends(&text[m.start() + token.len()..]).then_some(token)
             })
-            .map(|m| m.as_str())
             .collect()
     } else {
         text.lines()
@@ -68,6 +80,40 @@ pub fn targets(text: &str, extract: bool) -> Result<Vec<(u32, u32)>> {
         merged.push((start, end));
     }
     Ok(merged)
+}
+
+/// A trailing dot ends a sentence unless it continues a longer dotted name or number.
+fn token_ends(rest: &str) -> bool {
+    let mut chars = rest.chars();
+    match chars.next() {
+        None => true,
+        Some('.') => !chars.next().is_some_and(|c| c.is_ascii_alphanumeric()),
+        Some(c) => !c.is_ascii_alphanumeric(),
+    }
+}
+
+/// Host/SNI must stay a domain name: URL parsers read forms such as `127.1` as IPv4 literals,
+/// which would connect there directly instead of using the pinned target address.
+pub fn host(text: &str) -> Result<String> {
+    let host = text.trim();
+    let is_domain = host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+        && reqwest::Url::parse(&format!("http://{host}/"))
+            .ok()
+            .and_then(|url| url.host_str().map(|h| h.parse::<Ipv4Addr>().is_err()))
+            .unwrap_or(false);
+    if !is_domain {
+        bail!("Host/SNIはドメイン名のみを指定してください");
+    }
+    Ok(host.to_owned())
 }
 
 pub fn ports(text: &str) -> Result<Vec<u16>> {
@@ -122,6 +168,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(job_count(&r, 1, 1), 257);
+    }
+    #[test]
+    fn extracts_from_sentences_and_urls() {
+        for (text, count) in [
+            ("src 10.0.0.1.", 1),
+            ("(10.0.0.1)", 1),
+            ("http://10.0.0.1/index.html", 1),
+            ("http://10.0.0.1/24", 1),
+            ("10.0.0.1/24/path", 1),
+            ("10.0.0.0/24.", 256),
+        ] {
+            assert_eq!(
+                job_count(&targets(text, true).unwrap(), 1, 1),
+                count,
+                "{text}"
+            );
+        }
+        for text in ["10.0.0.1.example.com", "1.2.3.4.5", "1.2.3.4/24.5"] {
+            assert!(targets(text, true).is_err(), "{text}");
+        }
+    }
+    #[test]
+    fn host_must_be_a_domain_name() {
+        assert_eq!(host(" fixture.test ").unwrap(), "fixture.test");
+        assert!(host("Example.COM").is_ok());
+        for s in [
+            "127.1", "123", "0x7f.1", "1.2.3.4", "a.1", "a..b", "-a.b", "a_b.c",
+        ] {
+            assert!(host(s).is_err(), "{s}");
+        }
     }
     #[test]
     fn validates_ports() {

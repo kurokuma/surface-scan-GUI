@@ -24,7 +24,8 @@ pub fn run_worker() -> Result<()> {
     anyhow::ensure!(
         (1..=8).contains(&config.workers)
             && config.worker_index < config.workers
-            && (1..=1024).contains(&config.concurrency),
+            && (1..=1024).contains(&config.concurrency)
+            && (config.host.is_empty() || crate::input::host(&config.host).is_ok()),
         "invalid worker configuration"
     );
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -32,7 +33,8 @@ pub fn run_worker() -> Result<()> {
         .enable_all()
         .build()?;
     runtime.block_on(async {
-        let cfg = &config;
+        let config = Arc::new(config);
+        let cfg = &*config;
         let jobs = cfg
             .ranges
             .iter()
@@ -46,16 +48,33 @@ pub fn run_worker() -> Result<()> {
             .filter(|(i, _)| i % cfg.workers == cfg.worker_index)
             .map(|(_, job)| job);
         let mut results = stream::iter(jobs)
-            .map(|(ip, port, scheme)| crate::scan::probe(cfg, ip, port, scheme))
+            .map(|(ip, port, scheme)| {
+                // Probes run on runtime threads so a full stdout pipe here cannot stall their I/O
+                // and turn slow GUI consumption into false timeouts.
+                let config = config.clone();
+                let scheme = scheme.clone();
+                tokio::spawn(async move { crate::scan::probe(&config, ip, port, &scheme).await })
+            })
             .buffer_unordered(cfg.concurrency);
         let mut output = std::io::BufWriter::new(std::io::stdout().lock());
         while let Some(record) = results.next().await {
-            serde_json::to_writer(&mut output, &record)?;
+            serde_json::to_writer(&mut output, &record?)?;
             output.write_all(b"\n")?;
             output.flush()?;
         }
         Ok::<_, anyhow::Error>(())
     })
+}
+
+/// Workers end every record with a newline, so a final unterminated line means the process was
+/// killed mid-write. Unexpected exits are reported from the exit status, not from this fragment.
+fn read_record(reader: &mut impl BufRead, line: &mut Vec<u8>) -> Result<Option<Record>> {
+    line.clear();
+    reader.read_until(b'\n', line)?;
+    if line.last() != Some(&b'\n') {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_slice(line)?))
 }
 
 pub fn launch(
@@ -104,16 +123,16 @@ pub fn launch(
                     let stderr = child.stderr.take().unwrap();
                     let sender = tx.clone();
                     readers.push(std::thread::spawn(move || {
-                        for line in BufReader::new(stdout).lines() {
-                            match line
-                                .map_err(anyhow::Error::from)
-                                .and_then(|s| Ok(serde_json::from_str::<Record>(&s)?))
-                            {
-                                Ok(row) => {
+                        let mut stdout = BufReader::new(stdout);
+                        let mut line = Vec::new();
+                        loop {
+                            match read_record(&mut stdout, &mut line) {
+                                Ok(Some(row)) => {
                                     if sender.send(Event::Row(Box::new(row))).is_err() {
                                         break;
                                     }
                                 }
+                                Ok(None) => break,
                                 Err(e) => {
                                     let _ = sender.send(Event::Problem(format!("worker出力: {e}")));
                                     break;
@@ -176,4 +195,19 @@ pub fn launch(
         }
         let _ = tx.send(Event::Done(stopped || failed));
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn killed_worker_fragment_is_not_a_parse_error() {
+        let mut input = std::io::Cursor::new(b"{\"port\":80}\n{\"port\":8".to_vec());
+        let mut line = Vec::new();
+        let row = read_record(&mut input, &mut line).unwrap().unwrap();
+        assert_eq!(row.port, 80);
+        assert!(read_record(&mut input, &mut line).unwrap().is_none());
+        let mut input = std::io::Cursor::new(b"not json\n".to_vec());
+        assert!(read_record(&mut input, &mut line).is_err());
+    }
 }

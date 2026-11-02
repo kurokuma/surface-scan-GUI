@@ -192,37 +192,41 @@ pub async fn probe(config: &Config, ip: Ipv4Addr, port: u16, scheme: &str) -> Re
         record.title = title;
         record.title_sha256 = sha256(record.title.as_bytes());
         let base = Url::parse(&url)?;
-        let icon_url = base.join(icon.as_deref().unwrap_or("/favicon.ico"))?;
         // Keep every follow-up on the requested origin/IP/port; never follow redirects or CDN links.
-        if icon_url.origin() != base.origin()
-            || !icon_url.username().is_empty()
-            || icon_url.password().is_some()
-        {
-            record.favicon_error = "外部originのfaviconは取得対象外".into();
-        } else {
-            record.favicon_url = icon_url.to_string();
-            match async {
-                let response = client
-                    .get(icon_url)
-                    .header("Accept-Encoding", "identity")
-                    .send()
-                    .await?;
-                record.favicon_status = Some(response.status().as_u16());
-                if !response.status().is_success() {
-                    anyhow::bail!("favicon HTTP {}", response.status());
-                }
-                let (bytes, truncated) = read_body(response, config.body_limit).await?;
-                if truncated {
-                    anyhow::bail!("faviconが取得上限を超えました");
-                }
-                record.favicon_sha256 = sha256(&bytes);
-                record.favicon_mmh3 = Some(favicon_mmh3(&bytes));
-                Ok::<_, anyhow::Error>(())
-            }
-            .await
+        match base.join(icon.as_deref().unwrap_or("/favicon.ico")) {
+            Err(e) => record.favicon_error = format!("favicon URLが不正です: {e}"),
+            Ok(icon_url)
+                if icon_url.origin() != base.origin()
+                    || !icon_url.username().is_empty()
+                    || icon_url.password().is_some() =>
             {
-                Ok(_) => (),
-                Err(e) => record.favicon_error = format!("{e:#}"),
+                record.favicon_error = "外部originのfaviconは取得対象外".into();
+            }
+            Ok(icon_url) => {
+                record.favicon_url = icon_url.to_string();
+                match async {
+                    let response = client
+                        .get(icon_url)
+                        .header("Accept-Encoding", "identity")
+                        .send()
+                        .await?;
+                    record.favicon_status = Some(response.status().as_u16());
+                    if !response.status().is_success() {
+                        anyhow::bail!("favicon HTTP {}", response.status());
+                    }
+                    let (bytes, truncated) = read_body(response, config.body_limit).await?;
+                    if truncated {
+                        anyhow::bail!("faviconが取得上限を超えました");
+                    }
+                    record.favicon_sha256 = sha256(&bytes);
+                    record.favicon_mmh3 = Some(favicon_mmh3(&bytes));
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await
+                {
+                    Ok(_) => (),
+                    Err(e) => record.favicon_error = format!("{e:#}"),
+                }
             }
         }
         Ok::<_, anyhow::Error>(())
@@ -355,6 +359,47 @@ mod tests {
                 assert!(r.favicon_mmh3.is_none());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_favicon_url_is_not_a_probe_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 2048];
+            let _ = stream.read(&mut buf).await.unwrap();
+            let body = "<title>ok</title><link rel=icon href='http://'>";
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let cfg = Config {
+            ranges: vec![],
+            ports: vec![port],
+            schemes: vec![],
+            concurrency: 1,
+            timeout_secs: 2,
+            body_limit: 4096,
+            insecure: true,
+            host: String::new(),
+            worker_index: 0,
+            workers: 1,
+        };
+        let r = probe(&cfg, Ipv4Addr::LOCALHOST, port, "http").await;
+        server.await.unwrap();
+        assert!(r.error.is_empty(), "{}", r.error);
+        assert_eq!(r.title, "ok");
+        assert!(r.favicon_error.contains("favicon URL"));
     }
 
     #[test]

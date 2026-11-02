@@ -78,16 +78,66 @@ impl Record {
         Ok(format!("{}://{}:{}/", self.scheme, ip, self.port))
     }
 
+    /// Lowercased field values, one per line. Field names and escapes never match, and Base64
+    /// is left out because it only repeats the body as text that matches queries by chance.
     pub fn search_text(&self) -> String {
-        serde_json::to_string(self)
-            .unwrap_or_default()
-            .to_lowercase()
+        fn collect(value: &serde_json::Value, text: &mut String) {
+            match value {
+                serde_json::Value::String(s) => {
+                    text.push_str(s);
+                    text.push('\n');
+                }
+                serde_json::Value::Number(n) => {
+                    text.push_str(&n.to_string());
+                    text.push('\n');
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(|v| collect(v, text)),
+                serde_json::Value::Object(map) => map.values().for_each(|v| collect(v, text)),
+                serde_json::Value::Bool(_) | serde_json::Value::Null => (),
+            }
+        }
+        let mut text = self
+            .response_headers
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        text.push('\n');
+        if let Ok(serde_json::Value::Object(mut fields)) = serde_json::to_value(self) {
+            fields.remove("body_base64");
+            fields.values().for_each(|v| collect(v, &mut text));
+        }
+        text.to_lowercase()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn search_matches_values_not_field_names() {
+        let empty = Record::default().search_text();
+        for query in ["title", "favicon_mmh3", "null", "error"] {
+            assert!(!empty.contains(query), "{query}");
+        }
+        let mut row = Record {
+            body: "a\"b C:\\x".into(),
+            body_base64: "QUJDREVG".into(),
+            port: 8443,
+            ..Default::default()
+        };
+        row.response_headers
+            .insert("x-powered-by".into(), vec!["PHP".into()]);
+        row.tls = Some(TlsInfo {
+            subject: "CN=Fixture".into(),
+            ..Default::default()
+        });
+        let text = row.search_text();
+        for query in ["a\"b", "c:\\x", "8443", "x-powered-by", "php", "cn=fixture"] {
+            assert!(text.contains(query), "{query}");
+        }
+        assert!(!text.contains("qujdrevg"));
+    }
     #[test]
     fn browser_links_use_only_validated_endpoint() {
         let mut row = Record {

@@ -46,6 +46,18 @@ pub fn decode(bytes: &[u8], content_type: &str) -> (String, String, bool) {
         }
         None
     };
+    // WHATWG: bytes that could carry a readable meta tag cannot be UTF-16.
+    let meta = || {
+        meta().map(|encoding| {
+            if encoding == encoding_rs::UTF_16LE || encoding == encoding_rs::UTF_16BE {
+                encoding_rs::UTF_8
+            } else if encoding == encoding_rs::X_USER_DEFINED {
+                encoding_rs::WINDOWS_1252
+            } else {
+                encoding
+            }
+        })
+    };
     let encoding = bom.or(header).or_else(meta).unwrap_or_else(|| {
         if std::str::from_utf8(bytes).map_or_else(|e| e.error_len().is_none(), |_| true) {
             return encoding_rs::UTF_8;
@@ -61,6 +73,14 @@ pub fn decode(bytes: &[u8], content_type: &str) -> (String, String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn meta_utf16_is_read_as_utf8() {
+        let html = "<meta charset='utf-16'><title>日本語</title>";
+        let (text, encoding, lossy) = decode(html.as_bytes(), "text/html");
+        assert_eq!(text, html);
+        assert_eq!(encoding, "UTF-8");
+        assert!(!lossy);
+    }
     #[test]
     fn chinese_encodings_and_meta() {
         for (encoding, label, text) in [
