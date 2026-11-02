@@ -91,6 +91,11 @@ pub struct Record {
 }
 
 impl Record {
+    /// Keep HTTP error responses and TLS-only observations; omit connection-only failures.
+    pub fn has_fingerprint(&self) -> bool {
+        self.status.is_some() || self.tls.is_some()
+    }
+
     pub fn browser_url(&self) -> anyhow::Result<String> {
         anyhow::ensure!(
             self.port != 0 && matches!(self.scheme.as_str(), "http" | "https"),
@@ -143,6 +148,21 @@ impl Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn connection_failures_are_omitted_but_http_and_tls_observations_remain() {
+        let mut row = Record {
+            error: "connection refused / timeout / DNS failed".into(),
+            ..Default::default()
+        };
+        assert!(!row.has_fingerprint());
+        for status in [200, 301, 403, 404, 500] {
+            row.status = Some(status);
+            assert!(row.has_fingerprint());
+        }
+        row.status = None;
+        row.tls = Some(TlsInfo::default());
+        assert!(row.has_fingerprint());
+    }
     #[test]
     fn search_matches_values_not_field_names() {
         let empty = Record::default().search_text();

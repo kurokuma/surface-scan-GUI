@@ -277,12 +277,15 @@ impl ScannerApp {
                         }
                     }
                     Ok(Event::Row(job_id, row)) => {
-                        if self.rows.len() < self.max_rows {
+                        let keep = row.has_fingerprint();
+                        if !keep || self.rows.len() < self.max_rows {
                             if let Some(session) = self.scan_session.as_mut() {
                                 if session.accept(job_id) {
                                     self.received = session.completed();
-                                    self.rows.push(Arc::from(row));
-                                    self.dirty = true;
+                                    if keep {
+                                        self.rows.push(Arc::from(row));
+                                        self.dirty = true;
+                                    }
                                 }
                             }
                         }
@@ -341,7 +344,8 @@ impl ScannerApp {
                 UiEvent::Saved(Ok(path)) => self.message = format!("保存しました: {path}"),
                 UiEvent::Loaded(Ok(rows)) => {
                     self.scan_session = None;
-                    self.rows = rows;
+                    let loaded = rows.len();
+                    self.rows = rows.into_iter().filter(|r| r.has_fingerprint()).collect();
                     self.search_index.clear();
                     self.selected = None;
                     self.detail.clear();
@@ -355,7 +359,11 @@ impl ScannerApp {
                     self.started = None;
                     self.finished_elapsed = None;
                     self.elapsed_before_run = Duration::ZERO;
-                    self.message = format!("保存結果を読み込みました · {} 件", self.rows.len());
+                    self.message = format!(
+                        "保存結果を読み込みました · {} 件（HTTP/TLS情報なし {} 件を除外）",
+                        self.rows.len(),
+                        loaded - self.rows.len()
+                    );
                 }
                 UiEvent::Imported(Err(e)) | UiEvent::Saved(Err(e)) | UiEvent::Loaded(Err(e)) => {
                     self.message = e
@@ -606,7 +614,7 @@ impl eframe::App for ScannerApp {
             ui.horizontal(|ui| {
                 ui.heading("結果");
                 if ui.add_enabled(!self.running && !self.io_busy,egui::Button::new("結果を読込…")).clicked() { self.load_results(); }
-                if ui.add_enabled(!self.running && !self.io_busy && (!self.rows.is_empty() || self.has_pending()),egui::Button::new("結果をクリア")).on_hover_text("結果・詳細・検索条件・進捗と再開情報をクリアします。スキャン設定は保持します。").clicked() { self.clear_results(); }
+                if ui.add_enabled(!self.running && !self.io_busy && (!self.rows.is_empty() || self.has_pending() || self.total > 0),egui::Button::new("結果をクリア")).on_hover_text("結果・詳細・検索条件・進捗と再開情報をクリアします。スキャン設定は保持します。").clicked() { self.clear_results(); }
                 ui.label(format!("{} / {} 件", self.visible.len(), self.rows.len()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_enabled_ui(!self.io_busy && !self.rows.is_empty(), |ui| {

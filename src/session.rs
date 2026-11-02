@@ -2,7 +2,8 @@ use crate::model::{Config, DomainTarget};
 use std::collections::HashSet;
 
 /// A scan plan is immutable until completion or explicit reset. Completion is acknowledged
-/// only after a full result is retained, so killed/in-flight probes remain resumable.
+/// after a full result is retained or a connection-only failure is intentionally omitted,
+/// so killed/in-flight probes remain resumable.
 pub struct ScanSession {
     config: Config,
     completed: HashSet<u64>,
