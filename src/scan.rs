@@ -53,7 +53,12 @@ fn favicon_mmh3(bytes: &[u8]) -> i32 {
     mmh3(&mime)
 }
 
-pub fn client(config: &Config, ip: Ipv4Addr, port: u16) -> anyhow::Result<Client> {
+pub fn client(
+    config: &Config,
+    ip: Option<Ipv4Addr>,
+    port: u16,
+    host: &str,
+) -> anyhow::Result<Client> {
     let mut builder = Client::builder()
         .no_proxy()
         .no_gzip()
@@ -65,8 +70,10 @@ pub fn client(config: &Config, ip: Ipv4Addr, port: u16) -> anyhow::Result<Client
         .timeout(Duration::from_secs(config.timeout_secs))
         .pool_max_idle_per_host(0)
         .user_agent("WebServiceFingerprint/0.1 (service discovery)");
-    if !config.host.is_empty() {
-        builder = builder.resolve(&config.host, SocketAddr::new(ip.into(), port));
+    if let Some(ip) = ip {
+        if !host.is_empty() {
+            builder = builder.resolve(host, SocketAddr::new(ip.into(), port));
+        }
     }
     Ok(builder.build()?)
 }
@@ -115,27 +122,40 @@ fn html_info(body: &str) -> (String, Option<String>) {
     (title, icon)
 }
 
-pub async fn probe(config: &Config, ip: Ipv4Addr, port: u16, scheme: &str) -> Record {
+pub async fn probe(
+    config: &Config,
+    ip: Option<Ipv4Addr>,
+    port: u16,
+    scheme: &str,
+    domain: &str,
+) -> Record {
     let start = Instant::now();
-    let hostname = if config.host.is_empty() {
-        ip.to_string()
+    let hostname = if !domain.is_empty() {
+        domain.to_owned()
+    } else if config.host.is_empty() {
+        ip.map(|ip| ip.to_string()).unwrap_or_default()
     } else {
         config.host.clone()
     };
     let url = format!("{scheme}://{hostname}:{port}/");
     let mut record = Record {
-        ip: ip.to_string(),
+        target: if domain.is_empty() {
+            ip.map(|ip| ip.to_string()).unwrap_or_default()
+        } else {
+            domain.into()
+        },
+        ip: ip.map(|ip| ip.to_string()).unwrap_or_default(),
         port,
         scheme: scheme.into(),
         url: url.clone(),
-        host: hostname,
+        host: hostname.clone(),
         timestamp_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis(),
         ..Default::default()
     };
-    let client = match client(config, ip, port) {
+    let client = match client(config, ip, port, &hostname) {
         Ok(c) => c,
         Err(e) => {
             record.error = e.to_string();
@@ -148,6 +168,11 @@ pub async fn probe(config: &Config, ip: Ipv4Addr, port: u16, scheme: &str) -> Re
             .header("Accept-Encoding", "identity")
             .send()
             .await?;
+        if ip.is_none() {
+            if let Some(addr) = response.remote_addr() {
+                record.ip = addr.ip().to_string();
+            }
+        }
         record.status = Some(response.status().as_u16());
         record.http_version = format!("{:?}", response.version());
         for name in response.headers().keys() {
@@ -238,11 +263,25 @@ pub async fn probe(config: &Config, ip: Ipv4Addr, port: u16, scheme: &str) -> Re
     if scheme == "https" {
         match tokio::time::timeout(
             Duration::from_secs(config.timeout_secs),
-            crate::tls::inspect(&ip.to_string(), port, &config.host, config.insecure),
+            crate::tls::inspect(
+                if record.ip.is_empty() {
+                    &hostname
+                } else {
+                    &record.ip
+                },
+                port,
+                &hostname,
+                config.insecure,
+            ),
         )
         .await
         {
-            Ok(Ok(info)) => record.tls = Some(info),
+            Ok(Ok(info)) => {
+                if record.ip.is_empty() {
+                    record.ip = info.peer_ip.clone();
+                }
+                record.tls = Some(info);
+            }
             Ok(Err(e)) => record.tls_error = format!("{e:#}"),
             Err(_) => record.tls_error = "TLS metadata timeout".into(),
         }
@@ -254,6 +293,143 @@ pub async fn probe(config: &Config, ip: Ipv4Addr, port: u16, scheme: &str) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn domain_modes_preserve_http_host_and_capture_peer_ip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for pinned in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let domain = if pinned {
+                "fixture.invalid"
+            } else {
+                "localhost"
+            };
+            let server = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut connection, _) = listener.accept().await.unwrap();
+                    let mut request = vec![0; 4096];
+                    let size = connection.read(&mut request).await.unwrap();
+                    let request = String::from_utf8_lossy(&request[..size]).to_ascii_lowercase();
+                    assert!(
+                        request.contains(&format!("host: {domain}:{port}")),
+                        "{request}"
+                    );
+                    connection.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 22\r\nConnection: close\r\n\r\n<title>domain</title>  ").await.unwrap();
+                }
+            });
+            let config = Config {
+                ranges: vec![],
+                ports: vec![port],
+                schemes: vec!["http".into()],
+                concurrency: 1,
+                timeout_secs: 2,
+                body_limit: 1024,
+                insecure: true,
+                host: "override-must-not-be-used.invalid".into(),
+                worker_index: 0,
+                workers: 1,
+                completed_jobs: vec![],
+                domains: vec![],
+                resolve_domains: pinned,
+            };
+            let record = probe(
+                &config,
+                if pinned {
+                    Some(Ipv4Addr::LOCALHOST)
+                } else {
+                    None
+                },
+                port,
+                "http",
+                domain,
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(record.error.is_empty(), "{}", record.error);
+            assert_eq!(record.target, domain);
+            assert_eq!(record.host, domain);
+            assert_eq!(record.ip, "127.0.0.1");
+            assert_eq!(record.title, "domain");
+            assert!(record.url.starts_with(&format!("http://{domain}:")));
+        }
+    }
+
+    #[tokio::test]
+    async fn domain_https_uses_domain_sni_in_both_modes() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for pinned in [false, true] {
+            let domain = if pinned {
+                "fixture.invalid"
+            } else {
+                "localhost"
+            };
+            let rcgen::CertifiedKey { cert, key_pair } =
+                rcgen::generate_simple_self_signed(vec![domain.into()]).unwrap();
+            let tls_config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.der().clone()],
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into(),
+                )
+                .unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                for i in 0..3 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut stream = acceptor.accept(stream).await.unwrap();
+                    assert_eq!(stream.get_ref().1.server_name(), Some(domain));
+                    if i < 2 {
+                        let mut buf = vec![0; 4096];
+                        let _ = stream.read(&mut buf).await.unwrap();
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nTLS").await.unwrap();
+                        stream.shutdown().await.unwrap();
+                    }
+                }
+            });
+            let config = Config {
+                ranges: vec![],
+                ports: vec![port],
+                schemes: vec!["https".into()],
+                concurrency: 1,
+                timeout_secs: 2,
+                body_limit: 1024,
+                insecure: true,
+                host: String::new(),
+                worker_index: 0,
+                workers: 1,
+                completed_jobs: vec![],
+                domains: vec![],
+                resolve_domains: pinned,
+            };
+            let record = probe(
+                &config,
+                if pinned {
+                    Some(Ipv4Addr::LOCALHOST)
+                } else {
+                    None
+                },
+                port,
+                "https",
+                domain,
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(record.error.is_empty(), "{}", record.error);
+            assert!(record.tls_error.is_empty(), "{}", record.tls_error);
+            assert_eq!(record.ip, "127.0.0.1");
+            assert!(record.tls.unwrap().san.contains(&domain.into()));
+        }
+    }
     #[test]
     fn hash_vectors() {
         assert_eq!(mmh3(b""), 0);
@@ -295,8 +471,10 @@ mod tests {
             worker_index: 0,
             workers: 1,
             completed_jobs: vec![],
+            domains: vec![],
+            resolve_domains: false,
         };
-        let r = probe(&cfg, Ipv4Addr::LOCALHOST, port, "http").await;
+        let r = probe(&cfg, Some(Ipv4Addr::LOCALHOST), port, "http", "").await;
         tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .unwrap()
@@ -344,8 +522,10 @@ mod tests {
                 worker_index: 0,
                 workers: 1,
                 completed_jobs: vec![],
+                domains: vec![],
+                resolve_domains: false,
             };
-            let r = probe(&cfg, Ipv4Addr::LOCALHOST, port, "http").await;
+            let r = probe(&cfg, Some(Ipv4Addr::LOCALHOST), port, "http", "").await;
             tokio::time::timeout(Duration::from_secs(5), server)
                 .await
                 .unwrap()
@@ -397,8 +577,10 @@ mod tests {
             worker_index: 0,
             workers: 1,
             completed_jobs: vec![],
+            domains: vec![],
+            resolve_domains: false,
         };
-        let r = probe(&cfg, Ipv4Addr::LOCALHOST, port, "http").await;
+        let r = probe(&cfg, Some(Ipv4Addr::LOCALHOST), port, "http", "").await;
         server.await.unwrap();
         assert!(r.error.is_empty(), "{}", r.error);
         assert_eq!(r.title, "ok");

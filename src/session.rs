@@ -1,4 +1,4 @@
-use crate::{input, model::Config};
+use crate::model::{Config, DomainTarget};
 use std::collections::HashSet;
 
 /// A scan plan is immutable until completion or explicit reset. Completion is acknowledged
@@ -12,7 +12,7 @@ pub struct ScanSession {
 impl ScanSession {
     pub fn new(mut config: Config) -> Self {
         config.completed_jobs.clear();
-        let total = input::job_count(&config.ranges, config.ports.len(), config.schemes.len());
+        let total = config.job_count();
         Self {
             config,
             completed: HashSet::new(),
@@ -29,6 +29,18 @@ impl ScanSession {
     }
     pub fn pending(&self) -> bool {
         self.completed() < self.total
+    }
+
+    pub fn pin_domains(&mut self, domains: Vec<DomainTarget>) {
+        if self
+            .config
+            .domains
+            .iter()
+            .map(|d| &d.domain)
+            .eq(domains.iter().map(|d| &d.domain))
+        {
+            self.config.domains = domains;
+        }
     }
 
     pub fn resume_config(&self) -> Config {
@@ -57,6 +69,8 @@ mod tests {
             workers: 2,
             worker_index: 0,
             completed_jobs: vec![],
+            domains: vec![],
+            resolve_domains: false,
         };
         let mut session = ScanSession::new(config);
         assert_eq!(session.total, 8);
@@ -76,5 +90,38 @@ mod tests {
         }
         assert!(!session.pending());
         assert_eq!(session.completed(), 8);
+    }
+
+    #[test]
+    fn domain_pins_do_not_change_resume_job_ids() {
+        let cfg = Config {
+            ranges: vec![(0x7f000001, 0x7f000001)],
+            ports: vec![80],
+            schemes: vec!["http".into(), "https".into()],
+            concurrency: 1,
+            timeout_secs: 2,
+            body_limit: 1024,
+            insecure: true,
+            host: String::new(),
+            worker_index: 0,
+            workers: 1,
+            completed_jobs: vec![],
+            domains: vec![DomainTarget {
+                domain: "localhost".into(),
+                ip: None,
+            }],
+            resolve_domains: true,
+        };
+        let mut session = ScanSession::new(cfg);
+        assert_eq!(session.total, 4);
+        assert!(session.accept(2));
+        session.pin_domains(vec![DomainTarget {
+            domain: "localhost".into(),
+            ip: Some(std::net::Ipv4Addr::LOCALHOST),
+        }]);
+        let cfg = session.resume_config();
+        assert_eq!(cfg.domains[0].ip, Some(std::net::Ipv4Addr::LOCALHOST));
+        assert_eq!(cfg.completed_jobs, vec![2]);
+        assert_eq!(cfg.job_count(), 4);
     }
 }

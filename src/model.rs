@@ -2,6 +2,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DomainTarget {
+    pub domain: String,
+    pub ip: Option<std::net::Ipv4Addr>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub ranges: Vec<(u32, u32)>,
     pub ports: Vec<u16>,
@@ -16,11 +22,23 @@ pub struct Config {
     /// Stable job ordinals whose complete results are already retained by the GUI.
     #[serde(default)]
     pub completed_jobs: Vec<u64>,
+    #[serde(default)]
+    pub domains: Vec<DomainTarget>,
+    #[serde(default)]
+    pub resolve_domains: bool,
+}
+
+impl Config {
+    pub fn job_count(&self) -> u64 {
+        crate::input::job_count(&self.ranges, self.ports.len(), self.schemes.len())
+            + self.domains.len() as u64 * self.ports.len() as u64 * self.schemes.len() as u64
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TlsInfo {
+    pub peer_ip: String,
     pub version: String,
     pub cipher: String,
     pub subject: String,
@@ -37,6 +55,7 @@ pub struct TlsInfo {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Record {
+    pub target: String,
     pub ip: String,
     pub port: u16,
     pub scheme: String,
@@ -73,12 +92,19 @@ pub struct Record {
 
 impl Record {
     pub fn browser_url(&self) -> anyhow::Result<String> {
-        let ip: std::net::Ipv4Addr = self.ip.parse()?;
         anyhow::ensure!(
             self.port != 0 && matches!(self.scheme.as_str(), "http" | "https"),
             "IP・方式・ポートが不正です"
         );
-        Ok(format!("{}://{}:{}/", self.scheme, ip, self.port))
+        let endpoint = if self.ip.is_empty() {
+            crate::input::domain(&self.target)?
+        } else {
+            match self.ip.parse::<std::net::IpAddr>()? {
+                std::net::IpAddr::V4(ip) => ip.to_string(),
+                std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+            }
+        };
+        Ok(format!("{}://{}:{}/", self.scheme, endpoint, self.port))
     }
 
     /// Lowercased field values, one per line. Field names and escapes never match, and Base64
@@ -152,6 +178,14 @@ mod tests {
         };
         assert_eq!(row.browser_url().unwrap(), "https://192.0.2.1:8443/");
         row.scheme = "javascript".into();
+        assert!(row.browser_url().is_err());
+        row.scheme = "https".into();
+        row.ip = "::1".into();
+        assert_eq!(row.browser_url().unwrap(), "https://[::1]:8443/");
+        row.ip.clear();
+        row.target = "example.com".into();
+        assert_eq!(row.browser_url().unwrap(), "https://example.com:8443/");
+        row.target = "file:///untrusted".into();
         assert!(row.browser_url().is_err());
     }
 }

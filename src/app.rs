@@ -7,7 +7,7 @@ use crate::{
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use std::{
-    net::Ipv4Addr,
+    net::IpAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
@@ -26,6 +26,7 @@ pub struct ScannerApp {
     input: String,
     ports: String,
     extract: bool,
+    resolve_domains: bool,
     http: bool,
     https: bool,
     concurrency: usize,
@@ -117,6 +118,7 @@ impl ScannerApp {
             input: String::new(),
             ports: "80,443,8080,8443".into(),
             extract: false,
+            resolve_domains: false,
             http: true,
             https: true,
             concurrency: 64,
@@ -169,7 +171,7 @@ impl ScannerApp {
             let config = self.scan_session.as_ref().unwrap().resume_config();
             return self.launch_scan(config);
         }
-        let ranges = input::targets(&self.input, self.extract)?;
+        let (ranges, domains) = input::mixed_targets(&self.input, self.extract)?;
         let ports = input::ports(&self.ports)?;
         let schemes: Vec<String> = [(self.http, "http"), (self.https, "https")]
             .into_iter()
@@ -182,8 +184,6 @@ impl ScannerApp {
         } else {
             input::host(&self.host)?
         };
-        let total = input::job_count(&ranges, ports.len(), schemes.len());
-        anyhow::ensure!(total <= self.max_jobs, "予定プローブ数 {} が上限 {} を超えています。対象を絞るか詳細設定の上限を変更してください", total, self.max_jobs);
         let config = Config {
             ranges,
             ports,
@@ -196,7 +196,11 @@ impl ScannerApp {
             worker_index: 0,
             workers: self.processes,
             completed_jobs: vec![],
+            domains,
+            resolve_domains: self.resolve_domains,
         };
+        let total = config.job_count();
+        anyhow::ensure!(total <= self.max_jobs, "予定プローブ数 {} が上限 {} を超えています。対象を絞るか詳細設定の上限を変更してください", total, self.max_jobs);
         self.clear_results();
         self.total = total;
         self.scan_session = Some(ScanSession::new(config.clone()));
@@ -221,10 +225,14 @@ impl ScannerApp {
         self.stop_reason.clear();
         self.running = true;
         self.dirty = true;
-        self.message = format!(
-            "スキャン中 · {}プロセス × {}同時プローブ",
-            config.workers, config.concurrency
-        );
+        self.message = if config.resolve_domains && config.domains.iter().any(|d| d.ip.is_none()) {
+            "ドメインのDNS解決中… 停止・再開できます".into()
+        } else {
+            format!(
+                "スキャン中 · {}プロセス × {}同時プローブ",
+                config.workers, config.concurrency
+            )
+        };
         if let Some(handle) = self.scan_handle.take() {
             let _ = handle.join();
         }
@@ -260,6 +268,14 @@ impl ScannerApp {
         if let Some(rx) = &self.scan_rx {
             while began.elapsed() < Duration::from_millis(8) {
                 match rx.try_recv() {
+                    Ok(Event::Prepared(domains)) => {
+                        if let Some(session) = self.scan_session.as_mut() {
+                            session.pin_domains(domains);
+                        }
+                        if !self.cancel.load(Ordering::Relaxed) {
+                            self.message = "スキャン中".into();
+                        }
+                    }
                     Ok(Event::Row(job_id, row)) => {
                         if self.rows.len() < self.max_rows {
                             if let Some(session) = self.scan_session.as_mut() {
@@ -391,25 +407,26 @@ impl ScannerApp {
             let b = &rows[b];
             let order = match column {
                 0 => {
-                    a.ip.parse::<Ipv4Addr>()
+                    a.ip.parse::<IpAddr>()
                         .ok()
-                        .cmp(&b.ip.parse::<Ipv4Addr>().ok())
+                        .cmp(&b.ip.parse::<IpAddr>().ok())
                 }
-                1 => a.port.cmp(&b.port),
-                2 => a.scheme.cmp(&b.scheme),
-                3 => a.status.cmp(&b.status),
-                4 => a.title.cmp(&b.title),
-                5 => a.body.cmp(&b.body),
-                6 => a.server.cmp(&b.server),
-                7 => a.content_type.cmp(&b.content_type),
-                8 => a.body_bytes.cmp(&b.body_bytes),
-                9 => a.elapsed_ms.cmp(&b.elapsed_ms),
-                10 => a
+                1 => a.target.cmp(&b.target),
+                2 => a.port.cmp(&b.port),
+                3 => a.scheme.cmp(&b.scheme),
+                4 => a.status.cmp(&b.status),
+                5 => a.title.cmp(&b.title),
+                6 => a.body.cmp(&b.body),
+                7 => a.server.cmp(&b.server),
+                8 => a.content_type.cmp(&b.content_type),
+                9 => a.body_bytes.cmp(&b.body_bytes),
+                10 => a.elapsed_ms.cmp(&b.elapsed_ms),
+                11 => a
                     .tls
                     .as_ref()
                     .map(|t| &t.version)
                     .cmp(&b.tls.as_ref().map(|t| &t.version)),
-                11 => a.favicon_mmh3.cmp(&b.favicon_mmh3),
+                12 => a.favicon_mmh3.cmp(&b.favicon_mmh3),
                 _ => a.error.cmp(&b.error),
             };
             if descending {
@@ -500,7 +517,7 @@ impl eframe::App for ScannerApp {
                 ui.heading(RichText::new("WEB SERVICE").color(Color32::from_rgb(78, 211, 187)));
                 ui.heading("/ FINGERPRINT");
                 ui.separator();
-                ui.label("IPv4 ネットワーク調査");
+                ui.label("IP / ドメイン調査");
                 if self.running {
                     ui.spinner();
                 }
@@ -526,10 +543,22 @@ impl eframe::App for ScannerApp {
             }
         });
         egui::SidePanel::left("settings").default_width(310.0).resizable(true).show(ctx, |ui| {
+            egui::TopBottomPanel::bottom("scan-controls").show_inside(ui, |ui| {
+                if self.has_pending() && !self.running { ui.label("一時停止中：結果を保持して続きから再開できます。新規スキャンは「結果をクリア」。"); }
+                ui.add_space(12.0);
+                let stopping = self.running && self.cancel.load(Ordering::Relaxed);
+                let start_label = if self.has_pending() && !self.running { "スキャン開始（続きから）" } else { "スキャン開始" };
+                if ui.add_enabled(!self.running && !self.io_busy, egui::Button::new(start_label).fill(Color32::from_rgb(24,111,100)).min_size(egui::vec2(ui.available_width(),36.0))).clicked() {
+                    if let Err(e) = self.start() { self.message = e.to_string(); }
+                }
+                if ui.add_enabled(self.running && !stopping, egui::Button::new(if stopping { "停止中…" } else { "スキャン停止" }).min_size(egui::vec2(ui.available_width(),32.0))).clicked() {
+                    self.cancel.store(true, Ordering::Relaxed); self.stop_reason = "ユーザーによる一時停止".into(); self.message = "停止中… 結果を保持しています".into();
+                }
+            });
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_space(8.0); ui.heading("スキャン設定"); ui.separator();
                 ui.add_enabled_ui(!self.running && !self.has_pending() && !self.io_busy, |ui| {
-                    ui.label("対象 IPv4 / CIDR");
+                    ui.label("対象 IPv4 / CIDR / ドメイン");
                     egui::ScrollArea::vertical()
                         .id_salt("target-input")
                         .min_scrolled_height(140.0)
@@ -538,10 +567,15 @@ impl eframe::App for ScannerApp {
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                         .show(ui, |ui| {
                             ui.add(egui::TextEdit::multiline(&mut self.input).desired_width(f32::INFINITY).desired_rows(7)
-                                .hint_text("192.168.1.1\n192.168.2.0/24\n\n1行ずつ入力 / そのまま貼り付け"));
+                                .hint_text("192.168.1.1\n192.168.2.0/24\nexample.com\n\n1行ずつ入力 / そのまま貼り付け"));
                         });
                     if ui.add_enabled(!self.io_busy, egui::Button::new("テキストファイルを読み込む…")).clicked() { self.import(); }
-                    ui.checkbox(&mut self.extract, "雑多なテキストからIPv4/CIDRを抽出");
+                    ui.checkbox(&mut self.extract, "雑多なテキストからIP・ドメインを抽出");
+                    egui::ComboBox::from_id_salt("domain-mode").selected_text(if self.resolve_domains {"事前DNS解決してIPv4に固定"} else {"ドメインURLのまま取得"}).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.resolve_domains,false,"ドメインURLのまま取得");
+                        ui.selectable_value(&mut self.resolve_domains,true,"事前DNS解決してIPv4に固定");
+                    });
+                    ui.small(if self.resolve_domains {"ドメインごとに1つのIPv4へ固定"} else {"ドメインのDNS解決は接続時に実施"});
                     ui.add_space(8.0); ui.label("ポート / 範囲 (1–65535)");
                     ui.text_edit_singleline(&mut self.ports).on_hover_text("例: 80,443,8000-8100 または 1-65535");
                     ui.horizontal(|ui| { ui.checkbox(&mut self.http, "HTTP"); ui.checkbox(&mut self.https, "HTTPS"); });
@@ -556,7 +590,7 @@ impl eframe::App for ScannerApp {
                     ui.checkbox(&mut self.insecure, "未検証・自己署名証明書も収集").on_hover_text("有効時はTLSの信頼性・ホスト名を検証しません。HTTP取得の接続では署名も検証しません。TLS情報収集の接続では署名ハンドシェイクを検証します。");
                     ui.collapsing("詳細設定", |ui| {
                         ui.label("Host / TLS SNI（任意のドメイン名）"); ui.text_edit_singleline(&mut self.host);
-                        ui.label("接続先は入力IPに固定されます");
+                        ui.label("IP対象専用。ドメイン対象は入力名をHost/SNIに使用");
                         ui.horizontal(|ui| { ui.label("プローブ上限"); ui.add(egui::DragValue::new(&mut self.max_jobs).range(1..=10_000_000).speed(100.0)); });
                         ui.label("保持上限に達すると停止します。本文・Base64・JSON表示にメモリを使用します。");
                     });
@@ -564,16 +598,6 @@ impl eframe::App for ScannerApp {
                 ui.add_enabled_ui(!self.running, |ui| {
                     ui.horizontal(|ui| { ui.label("結果保持上限"); ui.add(egui::DragValue::new(&mut self.max_rows).range(1..=100_000).speed(100.0)); });
                 });
-                if self.has_pending() && !self.running { ui.label("一時停止中：結果を保持して続きから再開できます。新規スキャンは「結果をクリア」。"); }
-                ui.add_space(12.0);
-                let stopping = self.running && self.cancel.load(Ordering::Relaxed);
-                let start_label = if self.has_pending() && !self.running { "スキャン開始（続きから）" } else { "スキャン開始" };
-                if ui.add_enabled(!self.running && !self.io_busy, egui::Button::new(start_label).fill(Color32::from_rgb(24,111,100)).min_size(egui::vec2(ui.available_width(),36.0))).clicked() {
-                    if let Err(e) = self.start() { self.message = e.to_string(); }
-                }
-                if ui.add_enabled(self.running && !stopping, egui::Button::new(if stopping { "停止中…" } else { "スキャン停止" }).min_size(egui::vec2(ui.available_width(),32.0))).clicked() {
-                    self.cancel.store(true, Ordering::Relaxed); self.stop_reason = "ユーザーによる一時停止".into(); self.message = "停止中… 結果を保持しています".into();
-                }
                 ui.add_space(8.0);
                 ui.small("CIDRはネットワーク・ブロードキャストを含む全アドレス。重複は除去します。リダイレクトは追跡しません。");
             });
@@ -684,11 +708,11 @@ impl eframe::App for ScannerApp {
                         .striped(true).resizable(true).vscroll(false)
                         .sense(egui::Sense::click())
                         .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
-                    for width in [125.0,60.0,60.0,60.0,230.0,280.0,130.0,160.0,80.0,80.0,80.0,110.0,260.0] {
+                    for width in [125.0,180.0,60.0,60.0,60.0,230.0,280.0,130.0,160.0,80.0,80.0,80.0,110.0,260.0] {
                         table = table.column(Column::initial(width).at_least(40.0).clip(true));
                     }
                     table.header(28.0, |mut header| {
-                        for (i,name) in ["IP","Port","方式","Status","Title","Body","Server","Content-Type","Body bytes","ms","TLS","Icon MMH3","Error"].iter().enumerate() {
+                        for (i,name) in ["IP","対象","Port","方式","Status","Title","Body","Server","Content-Type","Body bytes","ms","TLS","Icon MMH3","Error"].iter().enumerate() {
                             header.col(|ui| {
                                 let text = if self.sort == i { format!("{name} {}",if self.descending { "▼" } else { "▲" }) } else { name.to_string() };
                                 if ui.button(text).clicked() {
@@ -703,7 +727,7 @@ impl eframe::App for ScannerApp {
                         let r = &self.rows[index];
                         row.set_selected(self.selected == Some(index));
                         let preview = body_preview(&r.body);
-                        let values = [r.ip.clone(),r.port.to_string(),r.scheme.clone(),
+                        let values = [r.ip.clone(),if r.target.is_empty() {r.ip.clone()} else {r.target.clone()},r.port.to_string(),r.scheme.clone(),
                             r.status.map(|s|s.to_string()).unwrap_or_else(||"—".into()),
                             r.title.clone(),preview,r.server.clone(),r.content_type.clone(),
                             format!("{}{}",r.body_bytes,if r.body_truncated { "+" } else { "" }),
@@ -714,7 +738,7 @@ impl eframe::App for ScannerApp {
                                     ui.add(egui::Label::new(value).truncate().selectable(false));
                             });
                             if column == 0 && response.double_clicked() { open = Some(index); }
-                            if column == 5 { response.on_hover_text("本文は幅に合わせて省略しています。全文は詳細JSONで確認できます。"); }
+                            if column == 6 { response.on_hover_text("本文は幅に合わせて省略しています。全文は詳細JSONで確認できます。"); }
                         }
                         if row.response().clicked() { clicked = Some(index); }
                     }));

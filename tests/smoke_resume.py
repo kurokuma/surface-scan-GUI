@@ -94,7 +94,8 @@ def main():
         ip = int(ipaddress.IPv4Address("127.0.0.1"))
         cfg = dict(ranges=[[ip, ip]], ports=[s.server_port for s in servers],
                    schemes=["http", "https"], concurrency=1, timeout_secs=2,
-                   body_limit=4096, insecure=True, host="", workers=2)
+                   body_limit=4096, insecure=True, host="", workers=2,
+                   domains=[dict(domain="localhost", ip=None)])
         completed = set()
         all_rows = []
         for _ in range(2):
@@ -102,15 +103,15 @@ def main():
             assert rows
             completed.update(r["job_id"] for r in rows)
             all_rows.extend(rows)
-        assert len(completed) < 8, "fixture must leave unfinished work"
+        assert len(completed) < 16, "fixture must leave unfinished work"
         # Job IDs remain stable even when process partitioning changes.
         cfg["workers"] = 3
         rows = roundtrip(exe, cfg, completed)
         all_rows.extend(rows)
         completed.update(r["job_id"] for r in rows)
-        assert completed == set(range(8))
-        endpoints = [(r["record"]["ip"], r["record"]["port"], r["record"]["scheme"]) for r in all_rows]
-        assert len(endpoints) == len(set(endpoints)) == 8
+        assert completed == set(range(16))
+        endpoints = [(r["record"]["target"], r["record"]["ip"], r["record"]["port"], r["record"]["scheme"]) for r in all_rows]
+        assert len(endpoints) == len(set(endpoints)) == 16
         for result in all_rows:
             r = result["record"]
             if r["scheme"] == "http":

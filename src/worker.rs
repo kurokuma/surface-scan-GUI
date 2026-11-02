@@ -14,6 +14,7 @@ use std::{
 };
 
 pub enum Event {
+    Prepared(Vec<crate::model::DomainTarget>),
     Row(u64, Box<Record>),
     Problem(String),
     Done(bool),
@@ -26,13 +27,23 @@ struct WorkerRow {
 }
 
 pub fn run_worker() -> Result<()> {
-    let config: Config = serde_json::from_reader(std::io::stdin().lock())?;
+    let mut config: Config = serde_json::from_reader(std::io::stdin().lock())?;
+    for target in &mut config.domains {
+        target.domain = crate::input::domain(&target.domain)?;
+    }
     anyhow::ensure!(
         (1..=8).contains(&config.workers)
             && config.worker_index < config.workers
             && (1..=1024).contains(&config.concurrency)
             && (config.host.is_empty() || crate::input::host(&config.host).is_ok()),
         "invalid worker configuration"
+    );
+    anyhow::ensure!(
+        config
+            .domains
+            .iter()
+            .all(|d| crate::input::domain(&d.domain).is_ok()),
+        "invalid domain target"
     );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -46,26 +57,32 @@ pub fn run_worker() -> Result<()> {
         let jobs = cfg
             .ranges
             .iter()
-            .flat_map(|&(start, end)| (start as u64..=end as u64).map(|n| Ipv4Addr::from(n as u32)))
-            .flat_map(|ip| {
-                cfg.ports
-                    .iter()
-                    .flat_map(move |&port| cfg.schemes.iter().map(move |scheme| (ip, port, scheme)))
+            .flat_map(|&(start, end)| {
+                (start as u64..=end as u64).map(|n| (Some(Ipv4Addr::from(n as u32)), ""))
+            })
+            .chain(cfg.domains.iter().map(|d| (d.ip, d.domain.as_str())))
+            .flat_map(|(ip, domain)| {
+                cfg.ports.iter().flat_map(move |&port| {
+                    cfg.schemes
+                        .iter()
+                        .map(move |scheme| (ip, domain, port, scheme))
+                })
             })
             .enumerate()
             .filter(|(i, _)| {
                 i % cfg.workers == cfg.worker_index && !completed.contains(&(*i as u64))
             });
         let mut results = stream::iter(jobs)
-            .map(|(job_id, (ip, port, scheme))| {
+            .map(|(job_id, (ip, domain, port, scheme))| {
                 // Probes run on runtime threads so a full stdout pipe here cannot stall their I/O
                 // and turn slow GUI consumption into false timeouts.
                 let config = config.clone();
                 let scheme = scheme.clone();
+                let domain = domain.to_owned();
                 tokio::spawn(async move {
                     WorkerRow {
                         job_id: job_id as u64,
-                        record: crate::scan::probe(&config, ip, port, &scheme).await,
+                        record: crate::scan::probe(&config, ip, port, &scheme, &domain).await,
                     }
                 })
             })
@@ -97,6 +114,18 @@ pub fn launch(
     tx: SyncSender<Event>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
+        let mut config = config;
+        let prepared = crate::dns::prepare(&mut config, &cancel);
+        if !config.domains.is_empty() {
+            let _ = tx.send(Event::Prepared(config.domains.clone()));
+        }
+        if let Err(e) = prepared {
+            if !cancel.load(Ordering::Relaxed) {
+                let _ = tx.send(Event::Problem(format!("{e:#}")));
+            }
+            let _ = tx.send(Event::Done(true));
+            return;
+        }
         let mut children = Vec::new();
         let mut readers = Vec::new();
         let mut failed = false;

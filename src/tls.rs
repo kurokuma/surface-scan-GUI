@@ -72,6 +72,7 @@ pub async fn inspect(ip: &str, port: u16, host: &str, insecure: bool) -> Result<
         host.to_owned()
     })?;
     let stream = TcpStream::connect((ip, port)).await?;
+    let peer_ip = stream.peer_addr()?.ip().to_string();
     let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
         .connect(name, stream)
         .await?;
@@ -96,6 +97,7 @@ pub async fn inspect(ip: &str, port: u16, host: &str, insecure: bool) -> Result<
         })
         .unwrap_or_default();
     Ok(TlsInfo {
+        peer_ip,
         version: format!(
             "{:?}",
             session.protocol_version().context("TLS versionなし")?

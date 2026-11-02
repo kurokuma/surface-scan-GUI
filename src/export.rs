@@ -242,6 +242,20 @@ mod tests {
         assert_eq!(load(&json).unwrap()[0].title, "中文");
         fs::write(&json, r#"[{"ip":"bad","port":80,"scheme":"file"}]"#).unwrap();
         assert!(load(&json).is_err());
+        let domain_error = Record {
+            target: "example.com".into(),
+            port: 443,
+            scheme: "https".into(),
+            error: "DNS failed".into(),
+            ..Default::default()
+        };
+        for (file, is_json) in [(&json, true), (&path, false)] {
+            save(file, std::slice::from_ref(&domain_error), is_json).unwrap();
+            let restored = load(file).unwrap();
+            assert_eq!(restored[0].target, "example.com");
+            assert!(restored[0].ip.is_empty());
+            assert_eq!(restored[0].error, "DNS failed");
+        }
         fs::remove_file(path).unwrap();
         fs::remove_file(json).unwrap();
     }
